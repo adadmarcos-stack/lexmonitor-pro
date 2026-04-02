@@ -1,32 +1,12 @@
 from flask import Flask, request, render_template
 from config import HOST, PORT
-from db import init_db, get_conn
 
 app = Flask(__name__)
-init_db()
+
 
 def carregar_publicacoes():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT id, processo, data_publicacao, texto, relevante, motivo_filtro, enviado_email, criado_em
-    FROM publicacoes
-    ORDER BY id DESC
-    """)
-    itens = []
-    for row in cur.fetchall():
-        itens.append({
-            "id": row["id"],
-            "processo": row["processo"] or "",
-            "data_publicacao": row["data_publicacao"] or "",
-            "texto": row["texto"] or "",
-            "relevante": bool(row["relevante"]),
-            "motivo": row["motivo_filtro"] or "",
-            "enviado_email": bool(row["enviado_email"]),
-            "criado_em": row["criado_em"] or "",
-        })
-    conn.close()
-    return itens
+    return []
+
 
 def filtrar_publicacoes(publicacoes, busca="", somente_relevantes=False, somente_novas=False):
     busca_norm = (busca or "").upper()
@@ -43,6 +23,7 @@ def filtrar_publicacoes(publicacoes, busca="", somente_relevantes=False, somente
         filtradas.append(item)
     return filtradas
 
+
 def resumo(publicacoes):
     total = len(publicacoes)
     relevantes = sum(1 for p in publicacoes if p["relevante"])
@@ -50,14 +31,17 @@ def resumo(publicacoes):
     enviadas = sum(1 for p in publicacoes if p["enviado_email"])
     return total, relevantes, novas, enviadas
 
+
 @app.route("/")
 def index():
     busca = request.args.get("q", "")
     somente_relevantes = request.args.get("relevantes") == "1"
     somente_novas = request.args.get("novas") == "1"
+
     publicacoes = carregar_publicacoes()
     filtradas = filtrar_publicacoes(publicacoes, busca, somente_relevantes, somente_novas)
     total, relevantes, novas, enviadas = resumo(filtradas)
+
     return render_template(
         "index.html",
         publicacoes=filtradas,
@@ -69,6 +53,12 @@ def index():
         novas=novas,
         enviadas=enviadas,
     )
+
+
+@app.route("/ping")
+def ping():
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, debug=False)
