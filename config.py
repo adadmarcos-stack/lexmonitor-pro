@@ -1,24 +1,36 @@
 import os
-from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DB_FILE = DATA_DIR / "publicacoes.db"
-LOG_FILE = DATA_DIR / "log.txt"
-PAGINA_FILE = DATA_DIR / "pagina.txt"
-EXTRAIDAS_FILE = DATA_DIR / "publicacoes_extraidas.txt"
-
-EMAIL = os.getenv("EMAIL", "adadjammmal@gmail.com")
-SENHA_APP = os.getenv("SENHA_APP", "COLE_SUA_SENHA_DE_APP_AQUI")
-
-OAB = os.getenv("OAB", "113674")
-CPF = os.getenv("CPF", "06819623640")
-RG = os.getenv("RG", "12989116")
-UF = os.getenv("UF", "MG")
-
-MAX_PAGINAS = int(os.getenv("MAX_PAGINAS", "10"))
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "10000"))
+SECRET_KEY = os.getenv("SECRET_KEY", "troque-no-render")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+LOGIN_APP_EMAIL = os.getenv("LOGIN_APP_EMAIL", "adadjammal@gmail.com").strip().lower()
+LOGIN_APP_PASSWORD = os.getenv("LOGIN_APP_PASSWORD", "").strip()
+
+OAB_LOGIN_URL = os.getenv("OAB_LOGIN_URL", "https://recortedigital.oabmg.org.br/").strip()
+OAB_NUMERO = os.getenv("OAB_NUMERO", "").strip()
+OAB_UF = os.getenv("OAB_UF", "MG").strip()
+OAB_CPF = os.getenv("OAB_CPF", "").strip()
+OAB_IDENTIDADE = os.getenv("OAB_IDENTIDADE", "").strip()
+
+JUSBRASIL_ENABLED = os.getenv("JUSBRASIL_ENABLED", "false").lower() == "true"
+JUSBRASIL_LOGIN_URL = os.getenv("JUSBRASIL_LOGIN_URL", "https://www.jusbrasil.com.br/login?next_url=https%3A%2F%2Fwww.jusbrasil.com.br%2F").strip()
+JUSBRASIL_PROCESSOS_URL = os.getenv("JUSBRASIL_PROCESSOS_URL", "https://www.jusbrasil.com.br/acompanhamentos/processos/").strip()
+JUSBRASIL_EMAIL = os.getenv("JUSBRASIL_EMAIL", "").strip()
+JUSBRASIL_PASSWORD = os.getenv("JUSBRASIL_PASSWORD", "").strip()
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "").strip() or SMTP_USER
+
+GOOGLE_CALENDAR_ENABLED = os.getenv("GOOGLE_CALENDAR_ENABLED", "false").lower() == "true"
+GOOGLE_CALENDAR_ACCESS_TOKEN = os.getenv("GOOGLE_CALENDAR_ACCESS_TOKEN", "").strip()
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary").strip()
+
+OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "false").lower() == "true"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()

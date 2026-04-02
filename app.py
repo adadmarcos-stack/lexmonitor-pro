@@ -1,55 +1,10 @@
-from flask import Flask, request, render_template
-from config import HOST, PORT
-from db import init_db, get_conn
-import threading
-import time
-
-from monitor_oab import executar_monitor
+from flask import Flask, request, render_template, redirect, url_for, session
+from config import HOST, PORT, SECRET_KEY, LOGIN_APP_EMAIL, LOGIN_APP_PASSWORD
+from db import init_db, fetch_publicacoes
 
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
 init_db()
-
-
-# 🔥 LOOP AUTOMÁTICO
-def loop_monitor():
-    while True:
-        try:
-            print("Rodando monitor automático...")
-            executar_monitor()
-        except Exception as e:
-            print(f"Erro no monitor: {e}")
-
-        time.sleep(600)  # 10 minutos
-
-
-# 🚀 INICIA THREAD AUTOMÁTICA
-thread = threading.Thread(target=loop_monitor, daemon=True)
-thread.start()
-
-
-def carregar_publicacoes():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT id, processo, data_publicacao, texto, relevante, motivo_filtro, enviado_email, criado_em
-    FROM publicacoes
-    ORDER BY id DESC
-    """)
-    itens = []
-    for row in cur.fetchall():
-        itens.append({
-            "id": row["id"],
-            "processo": row["processo"] or "",
-            "data_publicacao": row["data_publicacao"] or "",
-            "texto": row["texto"] or "",
-            "relevante": bool(row["relevante"]),
-            "motivo": row["motivo_filtro"] or "",
-            "enviado_email": bool(row["enviado_email"]),
-            "criado_em": row["criado_em"] or "",
-        })
-    conn.close()
-    return itens
-
 
 def filtrar_publicacoes(publicacoes, busca="", somente_relevantes=False, somente_novas=False):
     busca_norm = (busca or "").upper()
@@ -60,12 +15,11 @@ def filtrar_publicacoes(publicacoes, busca="", somente_relevantes=False, somente
         if somente_novas and item["enviado_email"]:
             continue
         if busca_norm:
-            alvo = f"{item['processo']} {item['data_publicacao']} {item['texto']} {item['motivo']}".upper()
+            alvo = f"{item['processo']} {item['data_publicacao']} {item['texto']} {item['motivo_filtro']}".upper()
             if busca_norm not in alvo:
                 continue
         filtradas.append(item)
     return filtradas
-
 
 def resumo(publicacoes):
     total = len(publicacoes)
@@ -74,13 +28,34 @@ def resumo(publicacoes):
     enviadas = sum(1 for p in publicacoes if p["enviado_email"])
     return total, relevantes, novas, enviadas
 
+def logged_in():
+    return session.get("logged_in") is True
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = ""
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        password = (request.form.get("password") or "").strip()
+        if email == LOGIN_APP_EMAIL and password == LOGIN_APP_PASSWORD and LOGIN_APP_PASSWORD:
+            session["logged_in"] = True
+            return redirect(url_for("index"))
+        error = "Credenciais inválidas."
+    return render_template("login.html", error=error, login_email=LOGIN_APP_EMAIL)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 @app.route("/")
 def index():
+    if not logged_in():
+        return redirect(url_for("login"))
     busca = request.args.get("q", "")
     somente_relevantes = request.args.get("relevantes") == "1"
     somente_novas = request.args.get("novas") == "1"
-    publicacoes = carregar_publicacoes()
+    publicacoes = fetch_publicacoes()
     filtradas = filtrar_publicacoes(publicacoes, busca, somente_relevantes, somente_novas)
     total, relevantes, novas, enviadas = resumo(filtradas)
     return render_template(
@@ -93,8 +68,12 @@ def index():
         relevantes=relevantes,
         novas=novas,
         enviadas=enviadas,
+        login_email=LOGIN_APP_EMAIL,
     )
 
+@app.route("/ping")
+def ping():
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, debug=False)
