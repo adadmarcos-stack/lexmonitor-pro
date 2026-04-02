@@ -1,21 +1,30 @@
 from flask import Flask, request, render_template
 from config import HOST, PORT
 from db import init_db, get_conn
-
 import threading
 import time
 
-# IMPORTANTE: esse arquivo precisa existir depois
-# se ainda não tiver, depois a gente cria
-try:
-    from monitor_oab import executar_monitor
-except:
-    def executar_monitor():
-        print("Monitor ainda não implementado")
-
+from monitor_oab import executar_monitor
 
 app = Flask(__name__)
 init_db()
+
+
+# 🔥 LOOP AUTOMÁTICO
+def loop_monitor():
+    while True:
+        try:
+            print("Rodando monitor automático...")
+            executar_monitor()
+        except Exception as e:
+            print(f"Erro no monitor: {e}")
+
+        time.sleep(600)  # 10 minutos
+
+
+# 🚀 INICIA THREAD AUTOMÁTICA
+thread = threading.Thread(target=loop_monitor, daemon=True)
+thread.start()
 
 
 def carregar_publicacoes():
@@ -71,12 +80,9 @@ def index():
     busca = request.args.get("q", "")
     somente_relevantes = request.args.get("relevantes") == "1"
     somente_novas = request.args.get("novas") == "1"
-
     publicacoes = carregar_publicacoes()
     filtradas = filtrar_publicacoes(publicacoes, busca, somente_relevantes, somente_novas)
-
     total, relevantes, novas, enviadas = resumo(filtradas)
-
     return render_template(
         "index.html",
         publicacoes=filtradas,
@@ -88,21 +94,6 @@ def index():
         novas=novas,
         enviadas=enviadas,
     )
-
-
-# 🔥 LOOP AUTOMÁTICO (sem pagar plano)
-def loop_monitor():
-    while True:
-        try:
-            executar_monitor()
-        except Exception as e:
-            print("Erro no monitor:", e)
-
-        time.sleep(300)  # roda a cada 5 minutos
-
-
-thread = threading.Thread(target=loop_monitor, daemon=True)
-thread.start()
 
 
 if __name__ == "__main__":
