@@ -1,6 +1,10 @@
 import os
 import asyncio
+import subprocess
 from playwright.async_api import async_playwright
+
+# 🔥 FORÇA INSTALAÇÃO DO BROWSER EM TEMPO DE EXECUÇÃO
+subprocess.run(["playwright", "install"], check=True)
 
 OAB_NUMERO = os.getenv("OAB_NUMERO")
 OAB_UF = os.getenv("OAB_UF")
@@ -17,7 +21,6 @@ async def buscar_publicacoes():
         print("🌐 Acessando site...")
         await page.goto("https://recortedigital.oabmg.org.br")
 
-        # Aguarda carregamento
         await page.wait_for_timeout(3000)
 
         print("🔐 Preenchendo dados...")
@@ -37,7 +40,7 @@ async def buscar_publicacoes():
             print("⚠️ Nenhuma publicação encontrada.")
         else:
             print("✅ POSSÍVEL PUBLICAÇÃO ENCONTRADA!")
-            print(content[:1000])  # mostra parte da página
+            print(content[:1000])
 
         await browser.close()
 
