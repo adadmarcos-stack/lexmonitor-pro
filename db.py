@@ -41,17 +41,21 @@ def init_db():
     conn.close()
 
 
-def publicacao_existe_por_hash(hash_unico: str) -> bool:
+def publicacao_existe_por_hash(hash_unico):
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute(
         "SELECT 1 FROM publicacoes WHERE hash_unico = %s LIMIT 1",
         (hash_unico,),
     )
-    found = cur.fetchone() is not None
+
+    exists = cur.fetchone() is not None
+
     cur.close()
     conn.close()
-    return found
+
+    return exists
 
 
 def inserir_publicacao(
@@ -93,6 +97,7 @@ def inserir_publicacao(
         inserted = cur.rowcount > 0
         conn.commit()
         return inserted
+
     finally:
         cur.close()
         conn.close()
@@ -103,32 +108,16 @@ def fetch_publicacoes():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT
-            id,
-            fonte,
-            processo,
-            data_publicacao,
-            texto,
-            relevante,
-            motivo_filtro,
-            hash_unico,
-            enviado_email,
-            criado_em,
-            parte_autora,
-            parte_re,
-            tribunal,
-            resumo_ia,
-            o_que_fazer,
-            prazo,
-            urgencia,
-            evento_calendario_criado
+        SELECT *
         FROM publicacoes
         ORDER BY id DESC
     """)
 
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
+
     return rows
 
 
@@ -137,37 +126,21 @@ def buscar_publicacoes_pendentes_alerta():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT
-            id,
-            fonte,
-            processo,
-            data_publicacao,
-            texto,
-            relevante,
-            motivo_filtro,
-            hash_unico,
-            enviado_email,
-            criado_em,
-            parte_autora,
-            parte_re,
-            tribunal,
-            resumo_ia,
-            o_que_fazer,
-            prazo,
-            urgencia,
-            evento_calendario_criado
+        SELECT *
         FROM publicacoes
         WHERE enviado_email = FALSE
         ORDER BY id ASC
     """)
 
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
+
     return rows
 
 
-def marcar_email_enviado(publicacao_id: int):
+def marcar_email_enviado(publicacao_id):
     conn = get_conn()
     cur = conn.cursor()
 
@@ -177,11 +150,12 @@ def marcar_email_enviado(publicacao_id: int):
     )
 
     conn.commit()
+
     cur.close()
     conn.close()
 
 
-def marcar_evento_calendario(publicacao_id: int):
+def marcar_evento_calendario(publicacao_id):
     conn = get_conn()
     cur = conn.cursor()
 
@@ -191,5 +165,6 @@ def marcar_evento_calendario(publicacao_id: int):
     )
 
     conn.commit()
+
     cur.close()
     conn.close()
