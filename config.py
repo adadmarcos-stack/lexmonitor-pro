@@ -6,8 +6,8 @@ SECRET_KEY = os.getenv("SECRET_KEY", "troque-no-render")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-LOGIN_APP_EMAIL = os.getenv("LOGIN_APP_EMAIL", "adadjammal@gmail.com").strip().lower()
-LOGIN_APP_PASSWORD = os.getenv("LOGIN_APP_PASSWORD", "").strip()
+LOGIN_APP_EMAIL = "adadjammal@gmail.com"
+LOGIN_APP_PASSWORD = "123456"
 
 OAB_LOGIN_URL = os.getenv("OAB_LOGIN_URL", "https://recortedigital.oabmg.org.br/").strip()
 OAB_NUMERO = os.getenv("OAB_NUMERO", "").strip()
