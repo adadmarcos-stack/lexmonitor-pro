@@ -1,11 +1,11 @@
 import asyncio
 import hashlib
+import json
 import re
 import subprocess
 import urllib.request
-import json
-
 from datetime import datetime
+
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from config import (
@@ -33,8 +33,8 @@ def sha_key(*parts) -> str:
 
 def extract_processo(text: str) -> str:
     patterns = [
-        r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b",  # CNJ
-        r"\b\d{20}\b",  # número corrido
+        r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b",
+        r"\b\d{20}\b",
     ]
     for pat in patterns:
         m = re.search(pat, text)
@@ -56,17 +56,67 @@ def extract_datestr(text: str) -> str:
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 
-def ai_classify(text: str):
+def extrair_partes(texto: str):
+    texto_norm = normalize(texto)
+
+    patterns_autor = [
+        r"(?:autor|autora|requerente|impetrante|exequente)\s*:\s*([^.;\n]+)",
+    ]
+    patterns_reu = [
+        r"(?:réu|reu|ré|re|requerido|requerida|impetrado|executado)\s*:\s*([^.;\n]+)",
+    ]
+
+    parte_autora = ""
+    parte_re = ""
+
+    for pat in patterns_autor:
+        m = re.search(pat, texto_norm, flags=re.IGNORECASE)
+        if m:
+            parte_autora = normalize(m.group(1))
+            break
+
+    for pat in patterns_reu:
+        m = re.search(pat, texto_norm, flags=re.IGNORECASE)
+        if m:
+            parte_re = normalize(m.group(1))
+            break
+
+    return parte_autora, parte_re
+
+
+def identificar_tribunal(processo: str, texto: str) -> str:
+    texto_all = f"{processo} {texto}".lower()
+
+    if ".8.13." in texto_all:
+        return "TJMG"
+    if "tribunal de justiça de minas gerais" in texto_all:
+        return "TJMG"
+    if "superior tribunal de justiça" in texto_all or "stj" in texto_all:
+        return "STJ"
+    if "supremo tribunal federal" in texto_all or "stf" in texto_all:
+        return "STF"
+    if "tribunal regional federal" in texto_all or "trf" in texto_all:
+        return "TRF"
+    if "justiça do trabalho" in texto_all or "trt" in texto_all:
+        return "TRT"
+
+    return "OAB"
+
+
+def ai_classify_and_summarize(text: str):
     if not OPENAI_ENABLED or not OPENAI_API_KEY:
         return None
 
+    prompt = (
+        "Analise a publicação jurídica abaixo e responda APENAS em JSON válido com as chaves:\n"
+        "relevante (true/false), motivo (string), resumo_ia (string curta), "
+        "o_que_fazer (string prática), prazo (string), urgencia (alta/media/baixa).\n\n"
+        f"PUBLICAÇÃO:\n{text[:5000]}"
+    )
+
     body = {
         "model": OPENAI_MODEL,
-        "input": (
-            "Classifique a publicação jurídica a seguir como relevante ou não relevante. "
-            "Responda APENAS em JSON com chaves: relevante (true/false) e motivo (string curta).\n\n"
-            f"PUBLICAÇÃO:\n{text[:4000]}"
-        ),
+        "input": prompt,
     }
 
     req = urllib.request.Request(
@@ -80,52 +130,115 @@ def ai_classify(text: str):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read().decode("utf-8").lower()
-        if "true" in data:
-            return True, "IA marcou como relevante"
-        if "false" in data:
-            return False, "IA marcou como não relevante"
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw)
+
+        payload_text = json.dumps(data)
+
+        match = re.search(r"\{.*\}", payload_text, flags=re.DOTALL)
+        if not match:
+            return None
+
+        parsed = json.loads(match.group(0))
+        return {
+            "relevante": bool(parsed.get("relevante", False)),
+            "motivo": normalize(parsed.get("motivo", "")),
+            "resumo_ia": normalize(parsed.get("resumo_ia", "")),
+            "o_que_fazer": normalize(parsed.get("o_que_fazer", "")),
+            "prazo": normalize(parsed.get("prazo", "")),
+            "urgencia": normalize(parsed.get("urgencia", "media")).lower(),
+        }
     except Exception as e:
-        print(f"IA desabilitada por erro: {e}")
+        print(f"IA indisponível: {e}")
+        return None
 
-    return None
 
-
-def rule_classify(text: str):
+def rule_based_analysis(text: str):
     tl = (text or "").lower()
-    hits = [
-        "intimação", "prazo", "manifestação", "sentença", "decisão",
-        "audiência", "urgente", "cumprimento", "citação", "embargos",
-        "apelação", "contestação", "liminar", "despacho", "julgamento",
-        "sessão virtual", "ordem do dia",
-    ]
-    for h in hits:
-        if h in tl:
-            return True, f"Contém a palavra-chave: {h}"
-    return False, ""
+
+    relevante = False
+    motivo = ""
+    resumo_ia = "Publicação processual identificada."
+    o_que_fazer = "Analisar detalhadamente a publicação."
+    prazo = ""
+    urgencia = "baixa"
+
+    if "intimação" in tl:
+        relevante = True
+        motivo = "Contém intimação"
+        resumo_ia = "Intimação processual identificada."
+        o_que_fazer = "Verificar o ato intimado e preparar a providência cabível."
+        urgencia = "alta"
+
+    if "manifestação" in tl:
+        relevante = True
+        motivo = "Contém manifestação"
+        resumo_ia = "Há prazo para manifestação."
+        o_que_fazer = "Preparar manifestação no prazo indicado."
+        prazo = "Verificar prazo nos autos"
+        urgencia = "alta"
+
+    if "5 dias" in tl:
+        prazo = "5 dias"
+        urgencia = "alta"
+
+    if "contestação" in tl and "manifestação" in tl:
+        relevante = True
+        motivo = "Manifestação após contestação"
+        resumo_ia = "Intimação para manifestação após contestação."
+        o_que_fazer = "Analisar a contestação e preparar réplica ou manifestação adequada."
+        if not prazo:
+            prazo = "Verificar prazo nos autos"
+        urgencia = "alta"
+
+    if "despacho" in tl and not relevante:
+        relevante = False
+        motivo = "Despacho sem indicativo claro de urgência"
+        resumo_ia = "Despacho ordinário identificado."
+        o_que_fazer = "Acompanhar o andamento e verificar se há providência específica."
+        urgencia = "baixa"
+
+    if "sentença" in tl:
+        relevante = True
+        motivo = "Contém sentença"
+        resumo_ia = "Sentença identificada."
+        o_que_fazer = "Analisar o teor da sentença e verificar necessidade de recurso."
+        urgencia = "alta"
+
+    if "audiência" in tl:
+        relevante = True
+        motivo = "Contém audiência"
+        resumo_ia = "Audiência identificada."
+        o_que_fazer = "Conferir data, horário e providências preparatórias."
+        urgencia = "alta"
+
+    return {
+        "relevante": relevante,
+        "motivo": motivo,
+        "resumo_ia": resumo_ia,
+        "o_que_fazer": o_que_fazer,
+        "prazo": prazo,
+        "urgencia": urgencia,
+    }
 
 
-def classify_publicacao(text: str):
-    ai = ai_classify(text)
-    if ai is not None:
+def analisar_publicacao(text: str):
+    ai = ai_classify_and_summarize(text)
+    if ai:
         return ai
-    return rule_classify(text)
+    return rule_based_analysis(text)
 
 
 def is_date_line(line: str) -> bool:
     return bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}( \d{2}:\d{2}(:\d{2})?)?", line.strip()))
 
 
-def is_chip_or_meta_line(line: str) -> bool:
+def is_ignorable_line(line: str) -> bool:
     value = normalize(line).lower()
+
     if value in {"oab", "jusbrasil", "none", "geral", "pendente", "relevante"}:
         return True
-    return False
-
-
-def is_boilerplate_line(line: str) -> bool:
-    value = normalize(line).lower()
 
     boilerplates = [
         "portal de publicações",
@@ -140,58 +253,24 @@ def is_boilerplate_line(line: str) -> bool:
         "data de publicação",
         "data de envio entre",
         "todos dj",
-        "dj acre",
-        "dj alagoas",
-        "dj amapá",
-        "dj amazonas",
-        "dj bahia",
-        "dj ceará",
-        "dj distrito federal",
-        "dj espírito santo",
-        "dj goias",
-        "dj maranhão",
-        "dj mato grosso",
-        "dj mato grosso do sul",
-        "dj minas gerais",
-        "dj para",
-        "dj paraíba",
-        "dj paraná",
-        "dj pernambuco",
-        "dj piauí",
-        "dj rio de janeiro",
-        "dj rio grande do norte",
-        "dj rio grande do sul",
-        "dj rondonia",
-        "dj roraima",
-        "dj santa catarina",
-        "dj são paulo",
-        "dj sergipe",
-        "dj tocantins",
-        "dj união",
-        "tribunais superiores",
-        "diário oficial da união",
-        "limpar filtro",
-        "atendimento & suporte",
         "termos de uso",
         "dúvidas comuns",
         "whatsapp",
         "todos os direitos reservados",
-        "email: oabmg@recortedigitaladv.br",
-        "email oabmg@recortedigitaladv.br",
-        "telefone:",
-        "painel premium com oab",
+        "atendimento & suporte",
+        "limpar filtro",
+        "oabmg@recortedigitaladv.br",
     ]
 
     return any(term in value for term in boilerplates)
 
 
-def clean_text_lines(text: str):
-    raw_lines = text.splitlines()
+def clean_lines(text: str):
     lines = []
     prev = ""
 
-    for line in raw_lines:
-        line = normalize(line)
+    for raw in text.splitlines():
+        line = normalize(raw)
         if not line:
             continue
         if line == prev:
@@ -204,17 +283,17 @@ def clean_text_lines(text: str):
 
 def finalize_item(source: str, processo: str, data_publicacao: str, text_lines):
     texto = normalize(" ".join(text_lines))
-
     if not processo:
         return None
-
-    if len(texto) < 20:
+    if len(texto) < 15:
+        return None
+    if is_ignorable_line(texto):
         return None
 
-    if is_boilerplate_line(texto):
-        return None
+    analise = analisar_publicacao(texto)
+    parte_autora, parte_re = extrair_partes(texto)
+    tribunal = identificar_tribunal(processo, texto)
 
-    relevante, motivo = classify_publicacao(texto)
     key = sha_key(source, processo, data_publicacao, texto[:2000])
 
     return {
@@ -222,14 +301,21 @@ def finalize_item(source: str, processo: str, data_publicacao: str, text_lines):
         "processo": processo,
         "data_publicacao": data_publicacao or datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "texto": texto[:10000],
-        "relevante": relevante,
-        "motivo_filtro": motivo,
+        "relevante": analise["relevante"],
+        "motivo_filtro": analise["motivo"],
         "hash_unico": key,
+        "parte_autora": parte_autora,
+        "parte_re": parte_re,
+        "tribunal": tribunal,
+        "resumo_ia": analise["resumo_ia"],
+        "o_que_fazer": analise["o_que_fazer"],
+        "prazo": analise["prazo"],
+        "urgencia": analise["urgencia"],
     }
 
 
 def parse_cards_from_text(body_text: str, source: str):
-    lines = clean_text_lines(body_text)
+    lines = clean_lines(body_text)
     items = []
 
     current_processo = ""
@@ -238,10 +324,7 @@ def parse_cards_from_text(body_text: str, source: str):
     pending_date = ""
 
     for line in lines:
-        if is_chip_or_meta_line(line):
-            continue
-
-        if is_boilerplate_line(line):
+        if is_ignorable_line(line):
             continue
 
         if is_date_line(line):
@@ -283,6 +366,7 @@ def parse_cards_from_text(body_text: str, source: str):
 
     unique = []
     seen = set()
+
     for item in items:
         if item["hash_unico"] in seen:
             continue
@@ -329,13 +413,7 @@ async def fill_oab_login(page):
     except Exception:
         pass
 
-    for sel in [
-        "#btnEntrar",
-        "button[type='submit']",
-        "input[type='submit']",
-        "button:has-text('Entrar')",
-        "input[value='Entrar']",
-    ]:
+    for sel in ["#btnEntrar", "button[type='submit']", "input[type='submit']", "button:has-text('Entrar')", "input[value='Entrar']"]:
         try:
             if await page.locator(sel).count():
                 await page.locator(sel).first.click()
@@ -351,10 +429,7 @@ async def scrape_oab():
         raise RuntimeError("Variáveis OAB_NUMERO, OAB_CPF e OAB_IDENTIDADE não configuradas.")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         page = await browser.new_page(viewport={"width": 1400, "height": 1000})
 
         try:
@@ -384,8 +459,7 @@ async def scrape_oab():
                 pass
 
             body_text = await page.locator("body").inner_text()
-            items = parse_cards_from_text(body_text, "oab")
-            return items
+            return parse_cards_from_text(body_text, "OAB Recorte Digital")
 
         finally:
             await browser.close()
@@ -454,10 +528,7 @@ async def scrape_jusbrasil():
         raise RuntimeError("Variáveis JUSBRASIL_EMAIL e JUSBRASIL_PASSWORD não configuradas.")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         page = await browser.new_page(viewport={"width": 1400, "height": 1000})
 
         try:
@@ -480,8 +551,7 @@ async def scrape_jusbrasil():
             await page.wait_for_timeout(5000)
 
             body_text = await page.locator("body").inner_text()
-            items = parse_cards_from_text(body_text, "jusbrasil")
-            return items
+            return parse_cards_from_text(body_text, "JusBrasil")
 
         finally:
             await browser.close()
@@ -502,6 +572,13 @@ def persist_items(items):
             relevante=item["relevante"],
             motivo_filtro=item["motivo_filtro"],
             hash_unico=item["hash_unico"],
+            parte_autora=item.get("parte_autora", ""),
+            parte_re=item.get("parte_re", ""),
+            tribunal=item.get("tribunal", ""),
+            resumo_ia=item.get("resumo_ia", ""),
+            o_que_fazer=item.get("o_que_fazer", ""),
+            prazo=item.get("prazo", ""),
+            urgencia=item.get("urgencia", ""),
         ):
             inserted += 1
 
