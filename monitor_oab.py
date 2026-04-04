@@ -9,13 +9,25 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from config import (
-    OAB_LOGIN_URL, OAB_NUMERO, OAB_UF, OAB_CPF, OAB_IDENTIDADE,
-    OPENAI_ENABLED, OPENAI_API_KEY, OPENAI_MODEL,
-    JUSBRASIL_ENABLED, JUSBRASIL_LOGIN_URL, JUSBRASIL_PROCESSOS_URL,
-    JUSBRASIL_EMAIL, JUSBRASIL_PASSWORD,
+    OAB_LOGIN_URL,
+    OAB_NUMERO,
+    OAB_UF,
+    OAB_CPF,
+    OAB_IDENTIDADE,
+    OPENAI_ENABLED,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    JUSBRASIL_ENABLED,
+    JUSBRASIL_LOGIN_URL,
+    JUSBRASIL_PROCESSOS_URL,
+    JUSBRASIL_EMAIL,
+    JUSBRASIL_PASSWORD,
 )
 from db import publicacao_existe_por_hash, inserir_publicacao
 from alert import process_alerts
+
+
+OAB_HISTORICO_URL = "https://recortedigital.oabmg.org.br/historico/historicodata.aspx"
 
 
 def ensure_playwright():
@@ -103,12 +115,29 @@ def identificar_tribunal(processo: str, texto: str) -> str:
     return "OAB"
 
 
+def _extract_text_from_responses_api_payload(payload: dict) -> str:
+    texts = []
+
+    output = payload.get("output", [])
+    for item in output:
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"}:
+                txt = content.get("text", "")
+                if txt:
+                    texts.append(txt)
+
+    if texts:
+        return "\n".join(texts)
+
+    return payload.get("output_text", "")
+
+
 def ai_classify_and_summarize(text: str):
     if not OPENAI_ENABLED or not OPENAI_API_KEY:
         return None
 
     prompt = (
-        "Analise a publicação jurídica abaixo e responda APENAS em JSON válido com as chaves:\n"
+        "Analise a publicação jurídica abaixo e responda APENAS em JSON válido com as chaves: "
         "relevante (true/false), motivo (string), resumo_ia (string curta), "
         "o_que_fazer (string prática), prazo (string), urgencia (alta/media/baixa).\n\n"
         f"PUBLICAÇÃO:\n{text[:5000]}"
@@ -132,11 +161,11 @@ def ai_classify_and_summarize(text: str):
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
             raw = resp.read().decode("utf-8")
-        data = json.loads(raw)
 
-        payload_text = json.dumps(data)
+        payload = json.loads(raw)
+        text_payload = _extract_text_from_responses_api_payload(payload)
 
-        match = re.search(r"\{.*\}", payload_text, flags=re.DOTALL)
+        match = re.search(r"\{.*\}", text_payload, flags=re.DOTALL)
         if not match:
             return None
 
@@ -168,13 +197,13 @@ def rule_based_analysis(text: str):
         relevante = True
         motivo = "Contém intimação"
         resumo_ia = "Intimação processual identificada."
-        o_que_fazer = "Verificar o ato intimado e preparar a providência cabível."
+        o_que_fazer = "Verificar o teor da intimação e preparar a providência cabível."
         urgencia = "alta"
 
     if "manifestação" in tl:
         relevante = True
         motivo = "Contém manifestação"
-        resumo_ia = "Há prazo para manifestação."
+        resumo_ia = "Há ato para manifestação."
         o_que_fazer = "Preparar manifestação no prazo indicado."
         prazo = "Verificar prazo nos autos"
         urgencia = "alta"
@@ -203,7 +232,7 @@ def rule_based_analysis(text: str):
         relevante = True
         motivo = "Contém sentença"
         resumo_ia = "Sentença identificada."
-        o_que_fazer = "Analisar o teor da sentença e verificar necessidade de recurso."
+        o_que_fazer = "Analisar a sentença e verificar necessidade de recurso."
         urgencia = "alta"
 
     if "audiência" in tl:
@@ -377,15 +406,38 @@ def parse_cards_from_text(body_text: str, source: str):
 
 
 async def fill_oab_login(page):
-    inputs = page.locator("input")
+    print("Preenchendo login OAB...")
 
-    try:
-        if await page.locator("#txbOAB").count():
-            await page.locator("#txbOAB").fill(OAB_NUMERO)
-        else:
-            await inputs.nth(0).fill(OAB_NUMERO)
-    except Exception:
-        pass
+    numero_limpo = re.sub(r"\D", "", OAB_NUMERO)
+    cpf_limpo = re.sub(r"\D", "", OAB_CPF)
+    identidade_limpa = re.sub(r"\D", "", OAB_IDENTIDADE)
+
+    selectors_numero = ["#txbOAB", "input[name='txbOAB']", "input[id*='OAB']"]
+    selectors_cpf = ["#txbCPF", "input[name='txbCPF']", "input[id*='CPF']"]
+    selectors_ci = ["#txbCI", "input[name='txbCI']", "input[id*='CI']"]
+    selectors_submit = [
+        "#btnEntrar",
+        "button[type='submit']",
+        "input[type='submit']",
+        "button:has-text('Entrar')",
+        "input[value='Entrar']",
+    ]
+
+    preenchido = False
+
+    for sel in selectors_numero:
+        try:
+            if await page.locator(sel).count():
+                await page.locator(sel).first.fill(numero_limpo or OAB_NUMERO)
+                preenchido = True
+                break
+        except Exception:
+            pass
+
+    if not preenchido:
+        inputs = page.locator("input")
+        if await inputs.count() >= 1:
+            await inputs.nth(0).fill(numero_limpo or OAB_NUMERO)
 
     try:
         selects = page.locator("select")
@@ -397,31 +449,65 @@ async def fill_oab_login(page):
     except Exception:
         pass
 
-    try:
-        if await page.locator("#txbCPF").count():
-            await page.locator("#txbCPF").fill(re.sub(r"\D", "", OAB_CPF))
-        else:
-            await inputs.nth(1).fill(re.sub(r"\D", "", OAB_CPF))
-    except Exception:
-        pass
+    preenchido = False
+    for sel in selectors_cpf:
+        try:
+            if await page.locator(sel).count():
+                await page.locator(sel).first.fill(cpf_limpo)
+                preenchido = True
+                break
+        except Exception:
+            pass
 
-    try:
-        if await page.locator("#txbCI").count():
-            await page.locator("#txbCI").fill(re.sub(r"\D", "", OAB_IDENTIDADE))
-        else:
-            await inputs.nth(2).fill(re.sub(r"\D", "", OAB_IDENTIDADE))
-    except Exception:
-        pass
+    if not preenchido:
+        inputs = page.locator("input")
+        if await inputs.count() >= 2:
+            await inputs.nth(1).fill(cpf_limpo)
 
-    for sel in ["#btnEntrar", "button[type='submit']", "input[type='submit']", "button:has-text('Entrar')", "input[value='Entrar']"]:
+    preenchido = False
+    for sel in selectors_ci:
+        try:
+            if await page.locator(sel).count():
+                await page.locator(sel).first.fill(identidade_limpa)
+                preenchido = True
+                break
+        except Exception:
+            pass
+
+    if not preenchido:
+        inputs = page.locator("input")
+        if await inputs.count() >= 3:
+            await inputs.nth(2).fill(identidade_limpa)
+
+    for sel in selectors_submit:
         try:
             if await page.locator(sel).count():
                 await page.locator(sel).first.click()
                 return
         except Exception:
-            continue
+            pass
 
     raise RuntimeError("Não encontrei o botão Entrar da OAB.")
+
+
+async def wait_for_oab_result(page):
+    try:
+        await page.wait_for_timeout(4000)
+
+        # Primeiro tenta detectar mudança de página/URL
+        for _ in range(8):
+            current_url = page.url.lower()
+            if "historico" in current_url or "historicodata" in current_url:
+                return
+            await page.wait_for_timeout(1500)
+
+        # Depois tenta ir direto para a página de histórico
+        print("Indo direto para histórico OAB...")
+        await page.goto(OAB_HISTORICO_URL, wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(4000)
+
+    except Exception as e:
+        print(f"Falha ao aguardar resultado OAB: {e}")
 
 
 async def scrape_oab():
@@ -429,39 +515,58 @@ async def scrape_oab():
         raise RuntimeError("Variáveis OAB_NUMERO, OAB_CPF e OAB_IDENTIDADE não configuradas.")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await browser.new_page(viewport={"width": 1400, "height": 1000})
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+
+        context = await browser.new_context(
+            viewport={"width": 1400, "height": 1000},
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        )
+
+        page = await context.new_page()
 
         try:
             print("Abrindo Recorte Digital...")
-            await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(2000)
 
-            print("Preenchendo login OAB...")
-            await fill_oab_login(page)
-
+            # Tentativa 1: carga leve
             try:
-                await page.wait_for_load_state("networkidle", timeout=30000)
-            except PlaywrightTimeoutError:
-                pass
+                await page.goto(OAB_LOGIN_URL, wait_until="commit", timeout=90000)
+            except Exception:
+                await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
 
             await page.wait_for_timeout(5000)
 
-            try:
-                if "historico" not in page.url.lower():
-                    await page.goto(
-                        "https://recortedigital.oabmg.org.br/historico/historicodata.aspx",
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
-                    await page.wait_for_timeout(3000)
-            except Exception:
-                pass
+            # Se a página ainda não estabilizou, tenta um refresh simples
+            if "recortedigital.oabmg.org.br" not in page.url.lower():
+                await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
+                await page.wait_for_timeout(4000)
+
+            await fill_oab_login(page)
+            await wait_for_oab_result(page)
+
+            # Se não caiu no histórico, força novamente
+            if "historico" not in page.url.lower():
+                print("Forçando histórico OAB após login...")
+                await page.goto(OAB_HISTORICO_URL, wait_until="domcontentloaded", timeout=90000)
+                await page.wait_for_timeout(5000)
 
             body_text = await page.locator("body").inner_text()
             return parse_cards_from_text(body_text, "OAB Recorte Digital")
 
         finally:
+            await context.close()
             await browser.close()
 
 
@@ -596,7 +701,7 @@ def executar_monitor():
         print(f"OAB retornou {len(oab_items)} itens.")
         all_items.extend(oab_items)
     except Exception as e:
-        print(f"Erro na captura OAB: {e}")
+        print(f"Erro ao capturar OAB: {e}")
 
     try:
         jb_items = asyncio.run(scrape_jusbrasil())
