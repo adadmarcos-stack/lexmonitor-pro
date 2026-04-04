@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import re
 import subprocess
 import urllib.request
@@ -28,6 +29,7 @@ from alert import process_alerts
 
 
 OAB_HISTORICO_URL = "https://recortedigital.oabmg.org.br/historico/historicodata.aspx"
+DEBUG_SCREENSHOT_PATH = "/tmp/oab_debug.png"
 
 
 def ensure_playwright():
@@ -479,35 +481,68 @@ async def fill_oab_login(page):
         if await inputs.count() >= 3:
             await inputs.nth(2).fill(identidade_limpa)
 
+    clicked = False
     for sel in selectors_submit:
         try:
             if await page.locator(sel).count():
                 await page.locator(sel).first.click()
-                return
+                clicked = True
+                break
         except Exception:
             pass
 
-    raise RuntimeError("Não encontrei o botão Entrar da OAB.")
+    if not clicked:
+        raise RuntimeError("Não encontrei o botão Entrar da OAB.")
+
+
+async def save_debug_screenshot(page, label: str):
+    try:
+        path = DEBUG_SCREENSHOT_PATH.replace(".png", f"_{label}.png")
+        await page.screenshot(path=path, full_page=True)
+        print(f"Screenshot salva em: {path}")
+    except Exception as e:
+        print(f"Falha ao salvar screenshot ({label}): {e}")
+
+
+async def open_oab_with_retry(page):
+    print("Abrindo Recorte Digital...")
+
+    errors = []
+
+    for attempt in range(1, 3):
+        try:
+            print(f"Tentativa OAB #{attempt}")
+            try:
+                await page.goto(OAB_LOGIN_URL, wait_until="commit", timeout=90000)
+            except Exception:
+                await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
+
+            await page.wait_for_timeout(6000)
+            await save_debug_screenshot(page, f"open_{attempt}")
+            return
+        except Exception as e:
+            errors.append(str(e))
+            print(f"Falha na tentativa #{attempt} ao abrir OAB: {e}")
+            await page.wait_for_timeout(3000)
+
+    raise RuntimeError("Não foi possível abrir a OAB. " + " | ".join(errors))
 
 
 async def wait_for_oab_result(page):
-    try:
-        await page.wait_for_timeout(4000)
+    await page.wait_for_timeout(5000)
 
-        # Primeiro tenta detectar mudança de página/URL
-        for _ in range(8):
-            current_url = page.url.lower()
-            if "historico" in current_url or "historicodata" in current_url:
-                return
-            await page.wait_for_timeout(1500)
+    # tenta detectar redirecionamento natural
+    for _ in range(10):
+        current_url = page.url.lower()
+        if "historico" in current_url or "historicodata" in current_url:
+            print("OAB redirecionou para histórico naturalmente.")
+            return
+        await page.wait_for_timeout(1500)
 
-        # Depois tenta ir direto para a página de histórico
-        print("Indo direto para histórico OAB...")
-        await page.goto(OAB_HISTORICO_URL, wait_until="domcontentloaded", timeout=90000)
-        await page.wait_for_timeout(4000)
-
-    except Exception as e:
-        print(f"Falha ao aguardar resultado OAB: {e}")
+    # se não redirecionou, força o histórico
+    print("Indo direto para histórico OAB...")
+    await page.goto(OAB_HISTORICO_URL, wait_until="domcontentloaded", timeout=90000)
+    await page.wait_for_timeout(6000)
 
 
 async def scrape_oab():
@@ -538,32 +573,26 @@ async def scrape_oab():
         page = await context.new_page()
 
         try:
-            print("Abrindo Recorte Digital...")
-
-            # Tentativa 1: carga leve
-            try:
-                await page.goto(OAB_LOGIN_URL, wait_until="commit", timeout=90000)
-            except Exception:
-                await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
-
-            await page.wait_for_timeout(5000)
-
-            # Se a página ainda não estabilizou, tenta um refresh simples
-            if "recortedigital.oabmg.org.br" not in page.url.lower():
-                await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
-                await page.wait_for_timeout(4000)
-
+            await open_oab_with_retry(page)
             await fill_oab_login(page)
-            await wait_for_oab_result(page)
+            await save_debug_screenshot(page, "after_login_click")
 
-            # Se não caiu no histórico, força novamente
-            if "historico" not in page.url.lower():
-                print("Forçando histórico OAB após login...")
-                await page.goto(OAB_HISTORICO_URL, wait_until="domcontentloaded", timeout=90000)
-                await page.wait_for_timeout(5000)
+            await wait_for_oab_result(page)
+            await save_debug_screenshot(page, "historico")
+
+            current_url = page.url.lower()
+            print(f"URL final OAB: {current_url}")
 
             body_text = await page.locator("body").inner_text()
-            return parse_cards_from_text(body_text, "OAB Recorte Digital")
+
+            items = parse_cards_from_text(body_text, "OAB Recorte Digital")
+
+            if not items:
+                print("OAB sem itens parseados. Tentando leitura bruta adicional.")
+                print("Trecho inicial da página OAB:")
+                print(body_text[:2000])
+
+            return items
 
         finally:
             await context.close()
