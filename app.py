@@ -54,20 +54,24 @@ def logged_in():
 def login():
     error = ""
 
+    config_email = (LOGIN_APP_EMAIL or "").strip().lower()
+    config_password = (LOGIN_APP_PASSWORD or "").strip()
+
     if request.method == "POST":
         email = (request.form.get("email") or "").strip().lower()
         password = (request.form.get("password") or "").strip()
-
-        config_email = (LOGIN_APP_EMAIL or "").strip().lower()
-        config_password = (LOGIN_APP_PASSWORD or "").strip()
 
         if email == config_email and password == config_password and config_password:
             session["logged_in"] = True
             return redirect(url_for("index"))
 
-        error = "Credenciais inválidas."
+        error = f"Credenciais inválidas. E-mail configurado no sistema: {config_email or '[VAZIO]'}"
 
-    return render_template("login.html", error=error, login_email=(LOGIN_APP_EMAIL or "").strip().lower())
+    return render_template(
+        "login.html",
+        error=error,
+        login_email=config_email,
+    )
 
 
 @app.route("/logout")
