@@ -58,13 +58,16 @@ def login():
         email = (request.form.get("email") or "").strip().lower()
         password = (request.form.get("password") or "").strip()
 
-        if email == LOGIN_APP_EMAIL and password == LOGIN_APP_PASSWORD and LOGIN_APP_PASSWORD:
+        config_email = (LOGIN_APP_EMAIL or "").strip().lower()
+        config_password = (LOGIN_APP_PASSWORD or "").strip()
+
+        if email == config_email and password == config_password and config_password:
             session["logged_in"] = True
             return redirect(url_for("index"))
 
         error = "Credenciais inválidas."
 
-    return render_template("login.html", error=error, login_email=LOGIN_APP_EMAIL)
+    return render_template("login.html", error=error, login_email=(LOGIN_APP_EMAIL or "").strip().lower())
 
 
 @app.route("/logout")
@@ -96,7 +99,7 @@ def index():
         relevantes=relevantes,
         novas=novas,
         enviadas=enviadas,
-        login_email=LOGIN_APP_EMAIL,
+        login_email=(LOGIN_APP_EMAIL or "").strip().lower(),
     )
 
 
