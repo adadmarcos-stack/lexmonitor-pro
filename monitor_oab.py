@@ -119,7 +119,7 @@ async def fill_oab_login(page):
         raise RuntimeError("Botão ENTRAR não encontrado.")
 
     print("⏳ Confirmando login...")
-    await page.wait_for_timeout(4000)
+    await page.wait_for_timeout(5000)
 
     body_text = await page.locator("body").inner_text()
     body_lower = body_text.lower()
@@ -174,8 +174,8 @@ async def fill_history_filters(page, days_back: int = 60):
 
 async def fluxo_pos_login(page):
     print("📂 Abrindo histórico...")
-    await page.goto(OAB_HISTORICO_URL, wait_until="domcontentloaded", timeout=90000)
-    await page.wait_for_timeout(5000)
+    await page.goto(OAB_HISTORICO_URL, wait_until="load", timeout=120000)
+    await page.wait_for_timeout(6000)
 
     body_text = await page.locator("body").inner_text()
     if "Dados incompletos. Favor preencher nome de usuário e senha." in body_text:
@@ -219,8 +219,8 @@ async def scrape_oab():
 
         try:
             print("🚀 Abrindo OAB...")
-            await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
-            await page.wait_for_timeout(4000)
+            await page.goto(OAB_LOGIN_URL, wait_until="load", timeout=120000)
+            await page.wait_for_timeout(6000)
 
             await fill_oab_login(page)
             await fluxo_pos_login(page)
