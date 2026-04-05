@@ -1,11 +1,9 @@
 import asyncio
 import hashlib
 import json
-import os
 import re
-import subprocess
-import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -15,33 +13,25 @@ from config import (
     OAB_UF,
     OAB_CPF,
     OAB_IDENTIDADE,
-    OPENAI_ENABLED,
-    OPENAI_API_KEY,
-    OPENAI_MODEL,
     JUSBRASIL_ENABLED,
     JUSBRASIL_LOGIN_URL,
     JUSBRASIL_PROCESSOS_URL,
     JUSBRASIL_EMAIL,
     JUSBRASIL_PASSWORD,
 )
-from db import publicacao_existe_por_hash, inserir_publicacao
-from alert import process_alerts
-
+from db import init_db, log_monitor, upsert_publication
+from process_ai import analyze_text
 
 OAB_HISTORICO_URL = "https://recortedigital.oabmg.org.br/historico/historicodata.aspx"
-DEBUG_SCREENSHOT_PATH = "/tmp/oab_debug.png"
+DEBUG_SCREENSHOT_DIR = "/tmp"
 
 
-def ensure_playwright():
-    subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
-
-
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+def normalize(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
 
 
 def sha_key(*parts) -> str:
-    raw = "|".join(normalize(p) for p in parts)
+    raw = "|".join(normalize(str(p)) for p in parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -50,10 +40,10 @@ def extract_processo(text: str) -> str:
         r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b",
         r"\b\d{20}\b",
     ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            return m.group(0)
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            return match.group(0)
     return ""
 
 
@@ -63,11 +53,36 @@ def extract_datestr(text: str) -> str:
         r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\b",
         r"\b\d{2}/\d{2}/\d{4}\b",
     ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            return m.group(0)
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            return match.group(0)
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def parse_date_br(value: str) -> Optional[datetime]:
+    value = normalize(value)
+    if not value:
+        return None
+
+    formats = [
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def to_iso_br(value: str) -> str:
+    dt = parse_date_br(value)
+    if dt:
+        return dt.isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def extrair_partes(texto: str):
@@ -84,15 +99,15 @@ def extrair_partes(texto: str):
     parte_re = ""
 
     for pat in patterns_autor:
-        m = re.search(pat, texto_norm, flags=re.IGNORECASE)
-        if m:
-            parte_autora = normalize(m.group(1))
+        match = re.search(pat, texto_norm, flags=re.IGNORECASE)
+        if match:
+            parte_autora = normalize(match.group(1))
             break
 
     for pat in patterns_reu:
-        m = re.search(pat, texto_norm, flags=re.IGNORECASE)
-        if m:
-            parte_re = normalize(m.group(1))
+        match = re.search(pat, texto_norm, flags=re.IGNORECASE)
+        if match:
+            parte_re = normalize(match.group(1))
             break
 
     return parte_autora, parte_re
@@ -105,160 +120,16 @@ def identificar_tribunal(processo: str, texto: str) -> str:
         return "TJMG"
     if "tribunal de justiça de minas gerais" in texto_all:
         return "TJMG"
-    if "superior tribunal de justiça" in texto_all or "stj" in texto_all:
+    if "superior tribunal de justiça" in texto_all or " stj " in f" {texto_all} ":
         return "STJ"
-    if "supremo tribunal federal" in texto_all or "stf" in texto_all:
+    if "supremo tribunal federal" in texto_all or " stf " in f" {texto_all} ":
         return "STF"
-    if "tribunal regional federal" in texto_all or "trf" in texto_all:
+    if "tribunal regional federal" in texto_all or " trf " in f" {texto_all} ":
         return "TRF"
-    if "justiça do trabalho" in texto_all or "trt" in texto_all:
+    if "justiça do trabalho" in texto_all or " trt " in f" {texto_all} ":
         return "TRT"
 
     return "OAB"
-
-
-def _extract_text_from_responses_api_payload(payload: dict) -> str:
-    texts = []
-
-    output = payload.get("output", [])
-    for item in output:
-        for content in item.get("content", []):
-            if content.get("type") in {"output_text", "text"}:
-                txt = content.get("text", "")
-                if txt:
-                    texts.append(txt)
-
-    if texts:
-        return "\n".join(texts)
-
-    return payload.get("output_text", "")
-
-
-def ai_classify_and_summarize(text: str):
-    if not OPENAI_ENABLED or not OPENAI_API_KEY:
-        return None
-
-    prompt = (
-        "Analise a publicação jurídica abaixo e responda APENAS em JSON válido com as chaves: "
-        "relevante (true/false), motivo (string), resumo_ia (string curta), "
-        "o_que_fazer (string prática), prazo (string), urgencia (alta/media/baixa).\n\n"
-        f"PUBLICAÇÃO:\n{text[:5000]}"
-    )
-
-    body = {
-        "model": OPENAI_MODEL,
-        "input": prompt,
-    }
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            raw = resp.read().decode("utf-8")
-
-        payload = json.loads(raw)
-        text_payload = _extract_text_from_responses_api_payload(payload)
-
-        match = re.search(r"\{.*\}", text_payload, flags=re.DOTALL)
-        if not match:
-            return None
-
-        parsed = json.loads(match.group(0))
-        return {
-            "relevante": bool(parsed.get("relevante", False)),
-            "motivo": normalize(parsed.get("motivo", "")),
-            "resumo_ia": normalize(parsed.get("resumo_ia", "")),
-            "o_que_fazer": normalize(parsed.get("o_que_fazer", "")),
-            "prazo": normalize(parsed.get("prazo", "")),
-            "urgencia": normalize(parsed.get("urgencia", "media")).lower(),
-        }
-    except Exception as e:
-        print(f"IA indisponível: {e}")
-        return None
-
-
-def rule_based_analysis(text: str):
-    tl = (text or "").lower()
-
-    relevante = False
-    motivo = ""
-    resumo_ia = "Publicação processual identificada."
-    o_que_fazer = "Analisar detalhadamente a publicação."
-    prazo = ""
-    urgencia = "baixa"
-
-    if "intimação" in tl:
-        relevante = True
-        motivo = "Contém intimação"
-        resumo_ia = "Intimação processual identificada."
-        o_que_fazer = "Verificar o teor da intimação e preparar a providência cabível."
-        urgencia = "alta"
-
-    if "manifestação" in tl:
-        relevante = True
-        motivo = "Contém manifestação"
-        resumo_ia = "Há ato para manifestação."
-        o_que_fazer = "Preparar manifestação no prazo indicado."
-        prazo = "Verificar prazo nos autos"
-        urgencia = "alta"
-
-    if "5 dias" in tl:
-        prazo = "5 dias"
-        urgencia = "alta"
-
-    if "contestação" in tl and "manifestação" in tl:
-        relevante = True
-        motivo = "Manifestação após contestação"
-        resumo_ia = "Intimação para manifestação após contestação."
-        o_que_fazer = "Analisar a contestação e preparar réplica ou manifestação adequada."
-        if not prazo:
-            prazo = "Verificar prazo nos autos"
-        urgencia = "alta"
-
-    if "despacho" in tl and not relevante:
-        relevante = False
-        motivo = "Despacho sem indicativo claro de urgência"
-        resumo_ia = "Despacho ordinário identificado."
-        o_que_fazer = "Acompanhar o andamento e verificar se há providência específica."
-        urgencia = "baixa"
-
-    if "sentença" in tl:
-        relevante = True
-        motivo = "Contém sentença"
-        resumo_ia = "Sentença identificada."
-        o_que_fazer = "Analisar a sentença e verificar necessidade de recurso."
-        urgencia = "alta"
-
-    if "audiência" in tl:
-        relevante = True
-        motivo = "Contém audiência"
-        resumo_ia = "Audiência identificada."
-        o_que_fazer = "Conferir data, horário e providências preparatórias."
-        urgencia = "alta"
-
-    return {
-        "relevante": relevante,
-        "motivo": motivo,
-        "resumo_ia": resumo_ia,
-        "o_que_fazer": o_que_fazer,
-        "prazo": prazo,
-        "urgencia": urgencia,
-    }
-
-
-def analisar_publicacao(text: str):
-    ai = ai_classify_and_summarize(text)
-    if ai:
-        return ai
-    return rule_based_analysis(text)
 
 
 def is_date_line(line: str) -> bool:
@@ -267,8 +138,20 @@ def is_date_line(line: str) -> bool:
 
 def is_ignorable_line(line: str) -> bool:
     value = normalize(line).lower()
+    if not value:
+        return True
 
-    if value in {"oab", "jusbrasil", "none", "geral", "pendente", "relevante"}:
+    exacts = {
+        "oab",
+        "jusbrasil",
+        "none",
+        "geral",
+        "pendente",
+        "relevante",
+        "histórico",
+        "histórico de publicações",
+    }
+    if value in exacts:
         return True
 
     boilerplates = [
@@ -291,16 +174,22 @@ def is_ignorable_line(line: str) -> bool:
         "atendimento & suporte",
         "limpar filtro",
         "oabmg@recortedigitaladv.br",
+        "pesquisar",
+        "filtro",
+        "filtrar",
+        "consulta",
+        "menu",
+        "sair",
     ]
 
     return any(term in value for term in boilerplates)
 
 
-def clean_lines(text: str):
+def clean_lines(text: str) -> List[str]:
     lines = []
     prev = ""
 
-    for raw in text.splitlines():
+    for raw in (text or "").splitlines():
         line = normalize(raw)
         if not line:
             continue
@@ -312,7 +201,7 @@ def clean_lines(text: str):
     return lines
 
 
-def finalize_item(source: str, processo: str, data_publicacao: str, text_lines):
+def finalize_item(source: str, processo: str, data_publicacao: str, text_lines: List[str]):
     texto = normalize(" ".join(text_lines))
     if not processo:
         return None
@@ -321,37 +210,29 @@ def finalize_item(source: str, processo: str, data_publicacao: str, text_lines):
     if is_ignorable_line(texto):
         return None
 
-    analise = analisar_publicacao(texto)
     parte_autora, parte_re = extrair_partes(texto)
     tribunal = identificar_tribunal(processo, texto)
-
-    key = sha_key(source, processo, data_publicacao, texto[:2000])
+    hash_unico = sha_key(source, processo, data_publicacao, texto[:2000])
 
     return {
         "fonte": source,
         "processo": processo,
         "data_publicacao": data_publicacao or datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "texto": texto[:10000],
-        "relevante": analise["relevante"],
-        "motivo_filtro": analise["motivo"],
-        "hash_unico": key,
+        "texto": texto[:12000],
+        "hash_unico": hash_unico,
         "parte_autora": parte_autora,
         "parte_re": parte_re,
         "tribunal": tribunal,
-        "resumo_ia": analise["resumo_ia"],
-        "o_que_fazer": analise["o_que_fazer"],
-        "prazo": analise["prazo"],
-        "urgencia": analise["urgencia"],
     }
 
 
-def parse_cards_from_text(body_text: str, source: str):
+def parse_cards_from_text(body_text: str, source: str) -> List[Dict]:
     lines = clean_lines(body_text)
     items = []
 
     current_processo = ""
     current_date = ""
-    current_text_lines = []
+    current_text_lines: List[str] = []
     pending_date = ""
 
     for line in lines:
@@ -381,6 +262,10 @@ def parse_cards_from_text(body_text: str, source: str):
             current_date = pending_date or ""
             pending_date = ""
             current_text_lines = []
+
+            remainder = normalize(line.replace(processo_found, "", 1))
+            if remainder and not is_ignorable_line(remainder):
+                current_text_lines.append(remainder)
             continue
 
         if current_processo:
@@ -397,7 +282,6 @@ def parse_cards_from_text(body_text: str, source: str):
 
     unique = []
     seen = set()
-
     for item in items:
         if item["hash_unico"] in seen:
             continue
@@ -407,12 +291,42 @@ def parse_cards_from_text(body_text: str, source: str):
     return unique
 
 
+async def save_debug_screenshot(page, label: str):
+    try:
+        path = f"{DEBUG_SCREENSHOT_DIR}/oab_debug_{label}.png"
+        await page.screenshot(path=path, full_page=True)
+        print(f"Screenshot salva em: {path}")
+    except Exception as e:
+        print(f"Falha ao salvar screenshot ({label}): {e}")
+
+
+async def open_oab_with_retry(page):
+    errors = []
+
+    for attempt in range(1, 3):
+        try:
+            print(f"Abrindo OAB, tentativa #{attempt}...")
+            try:
+                await page.goto(OAB_LOGIN_URL, wait_until="commit", timeout=90000)
+            except Exception:
+                await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
+
+            await page.wait_for_timeout(5000)
+            await save_debug_screenshot(page, f"open_{attempt}")
+            return
+        except Exception as e:
+            errors.append(str(e))
+            await page.wait_for_timeout(3000)
+
+    raise RuntimeError("Não foi possível abrir a OAB. " + " | ".join(errors))
+
+
 async def fill_oab_login(page):
     print("Preenchendo login OAB...")
 
-    numero_limpo = re.sub(r"\D", "", OAB_NUMERO)
-    cpf_limpo = re.sub(r"\D", "", OAB_CPF)
-    identidade_limpa = re.sub(r"\D", "", OAB_IDENTIDADE)
+    numero_limpo = re.sub(r"\D", "", OAB_NUMERO or "")
+    cpf_limpo = re.sub(r"\D", "", OAB_CPF or "")
+    identidade_limpa = re.sub(r"\D", "", OAB_IDENTIDADE or "")
 
     selectors_numero = ["#txbOAB", "input[name='txbOAB']", "input[id*='OAB']"]
     selectors_cpf = ["#txbCPF", "input[name='txbCPF']", "input[id*='CPF']"]
@@ -425,18 +339,17 @@ async def fill_oab_login(page):
         "input[value='Entrar']",
     ]
 
-    preenchido = False
-
+    filled = False
     for sel in selectors_numero:
         try:
             if await page.locator(sel).count():
                 await page.locator(sel).first.fill(numero_limpo or OAB_NUMERO)
-                preenchido = True
+                filled = True
                 break
         except Exception:
             pass
 
-    if not preenchido:
+    if not filled:
         inputs = page.locator("input")
         if await inputs.count() >= 1:
             await inputs.nth(0).fill(numero_limpo or OAB_NUMERO)
@@ -451,32 +364,32 @@ async def fill_oab_login(page):
     except Exception:
         pass
 
-    preenchido = False
+    filled = False
     for sel in selectors_cpf:
         try:
             if await page.locator(sel).count():
                 await page.locator(sel).first.fill(cpf_limpo)
-                preenchido = True
+                filled = True
                 break
         except Exception:
             pass
 
-    if not preenchido:
+    if not filled:
         inputs = page.locator("input")
         if await inputs.count() >= 2:
             await inputs.nth(1).fill(cpf_limpo)
 
-    preenchido = False
+    filled = False
     for sel in selectors_ci:
         try:
             if await page.locator(sel).count():
                 await page.locator(sel).first.fill(identidade_limpa)
-                preenchido = True
+                filled = True
                 break
         except Exception:
             pass
 
-    if not preenchido:
+    if not filled:
         inputs = page.locator("input")
         if await inputs.count() >= 3:
             await inputs.nth(2).fill(identidade_limpa)
@@ -495,57 +408,89 @@ async def fill_oab_login(page):
         raise RuntimeError("Não encontrei o botão Entrar da OAB.")
 
 
-async def save_debug_screenshot(page, label: str):
-    try:
-        path = DEBUG_SCREENSHOT_PATH.replace(".png", f"_{label}.png")
-        await page.screenshot(path=path, full_page=True)
-        print(f"Screenshot salva em: {path}")
-    except Exception as e:
-        print(f"Falha ao salvar screenshot ({label}): {e}")
-
-
-async def open_oab_with_retry(page):
-    print("Abrindo Recorte Digital...")
-
-    errors = []
-
-    for attempt in range(1, 3):
-        try:
-            print(f"Tentativa OAB #{attempt}")
-            try:
-                await page.goto(OAB_LOGIN_URL, wait_until="commit", timeout=90000)
-            except Exception:
-                await page.goto(OAB_LOGIN_URL, wait_until="domcontentloaded", timeout=90000)
-
-            await page.wait_for_timeout(6000)
-            await save_debug_screenshot(page, f"open_{attempt}")
-            return
-        except Exception as e:
-            errors.append(str(e))
-            print(f"Falha na tentativa #{attempt} ao abrir OAB: {e}")
-            await page.wait_for_timeout(3000)
-
-    raise RuntimeError("Não foi possível abrir a OAB. " + " | ".join(errors))
-
-
 async def wait_for_oab_result(page):
     await page.wait_for_timeout(5000)
 
-    # tenta detectar redirecionamento natural
     for _ in range(10):
         current_url = page.url.lower()
         if "historico" in current_url or "historicodata" in current_url:
-            print("OAB redirecionou para histórico naturalmente.")
+            print("OAB redirecionou para histórico.")
             return
         await page.wait_for_timeout(1500)
 
-    # se não redirecionou, força o histórico
-    print("Indo direto para histórico OAB...")
+    print("Indo diretamente ao histórico OAB...")
     await page.goto(OAB_HISTORICO_URL, wait_until="domcontentloaded", timeout=90000)
     await page.wait_for_timeout(6000)
 
 
-async def scrape_oab():
+async def try_fill_date_filters(page, days_back: int = 60):
+    start = (datetime.now() - timedelta(days=days_back)).strftime("%d/%m/%Y")
+    end = datetime.now().strftime("%d/%m/%Y")
+
+    possible_start = [
+        "input[name*='DataInicial']",
+        "input[name*='DtInicial']",
+        "input[name*='dtInicial']",
+        "input[id*='DataInicial']",
+        "input[id*='DtInicial']",
+        "input[id*='dtInicial']",
+        "input[name*='txtDataIni']",
+        "input[id*='txtDataIni']",
+    ]
+
+    possible_end = [
+        "input[name*='DataFinal']",
+        "input[name*='DtFinal']",
+        "input[name*='dtFinal']",
+        "input[id*='DataFinal']",
+        "input[id*='DtFinal']",
+        "input[id*='dtFinal']",
+        "input[name*='txtDataFim']",
+        "input[id*='txtDataFim']",
+    ]
+
+    possible_submit = [
+        "button:has-text('Pesquisar')",
+        "button:has-text('Filtrar')",
+        "input[value='Pesquisar']",
+        "input[value='Filtrar']",
+        "button[type='submit']",
+        "input[type='submit']",
+    ]
+
+    start_filled = False
+    end_filled = False
+
+    for sel in possible_start:
+        try:
+            if await page.locator(sel).count():
+                await page.locator(sel).first.fill(start)
+                start_filled = True
+                break
+        except Exception:
+            pass
+
+    for sel in possible_end:
+        try:
+            if await page.locator(sel).count():
+                await page.locator(sel).first.fill(end)
+                end_filled = True
+                break
+        except Exception:
+            pass
+
+    if start_filled or end_filled:
+        for sel in possible_submit:
+            try:
+                if await page.locator(sel).count():
+                    await page.locator(sel).first.click()
+                    await page.wait_for_timeout(5000)
+                    return
+            except Exception:
+                pass
+
+
+async def scrape_oab(days_back: int = 60) -> List[Dict]:
     if not OAB_NUMERO or not OAB_CPF or not OAB_IDENTIDADE:
         raise RuntimeError("Variáveis OAB_NUMERO, OAB_CPF e OAB_IDENTIDADE não configuradas.")
 
@@ -575,24 +520,28 @@ async def scrape_oab():
         try:
             await open_oab_with_retry(page)
             await fill_oab_login(page)
-            await save_debug_screenshot(page, "after_login_click")
-
+            await save_debug_screenshot(page, "after_login")
             await wait_for_oab_result(page)
+            await try_fill_date_filters(page, days_back=days_back)
             await save_debug_screenshot(page, "historico")
 
-            current_url = page.url.lower()
-            print(f"URL final OAB: {current_url}")
-
             body_text = await page.locator("body").inner_text()
-
             items = parse_cards_from_text(body_text, "OAB Recorte Digital")
 
             if not items:
-                print("OAB sem itens parseados. Tentando leitura bruta adicional.")
-                print("Trecho inicial da página OAB:")
+                print("OAB sem itens parseados. Trecho inicial:")
                 print(body_text[:2000])
 
-            return items
+            cutoff = datetime.now() - timedelta(days=days_back)
+            filtered = []
+            for item in items:
+                dt = parse_date_br(item.get("data_publicacao", ""))
+                if dt and dt >= cutoff:
+                    filtered.append(item)
+                elif not dt:
+                    filtered.append(item)
+
+            return filtered
 
         finally:
             await context.close()
@@ -654,7 +603,7 @@ async def fill_jus_login(page):
     raise RuntimeError("Não encontrei o botão de login do JusBrasil.")
 
 
-async def scrape_jusbrasil():
+async def scrape_jusbrasil(days_back: int = 60) -> List[Dict]:
     if not JUSBRASIL_ENABLED:
         return []
 
@@ -662,13 +611,21 @@ async def scrape_jusbrasil():
         raise RuntimeError("Variáveis JUSBRASIL_EMAIL e JUSBRASIL_PASSWORD não configuradas.")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await browser.new_page(viewport={"width": 1400, "height": 1000})
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1400, "height": 1000},
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+        )
+        page = await context.new_page()
 
         try:
             print("Abrindo login do JusBrasil...")
             await page.goto(JUSBRASIL_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(2500)
 
             print("Preenchendo login JusBrasil...")
             await fill_jus_login(page)
@@ -678,73 +635,146 @@ async def scrape_jusbrasil():
             except PlaywrightTimeoutError:
                 pass
 
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(4000)
 
             print("Abrindo área de processos do JusBrasil...")
             await page.goto(JUSBRASIL_PROCESSOS_URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(5000)
 
             body_text = await page.locator("body").inner_text()
-            return parse_cards_from_text(body_text, "JusBrasil")
+            items = parse_cards_from_text(body_text, "JusBrasil")
+
+            cutoff = datetime.now() - timedelta(days=days_back)
+            filtered = []
+            for item in items:
+                dt = parse_date_br(item.get("data_publicacao", ""))
+                if dt and dt >= cutoff:
+                    filtered.append(item)
+                elif not dt:
+                    filtered.append(item)
+
+            return filtered
 
         finally:
+            await context.close()
             await browser.close()
 
 
-def persist_items(items):
+def legacy_payload_from_item(item: Dict, analysis: Dict) -> Dict:
+    return {
+        "processo": item.get("processo", ""),
+        "data_publicacao": item.get("data_publicacao", ""),
+        "texto": item.get("texto", ""),
+        "relevante": bool(analysis.get("is_relevant", 0)),
+        "motivo_filtro": analysis.get("risk_level", ""),
+        "parte_autora": item.get("parte_autora", ""),
+        "parte_re": item.get("parte_re", ""),
+        "tribunal": item.get("tribunal", ""),
+        "resumo_ia": analysis.get("ai_summary", ""),
+        "o_que_fazer": analysis.get("ai_action", ""),
+        "prazo": analysis.get("deadline_date", "") or "",
+        "urgencia": analysis.get("risk_level", "") or "",
+        "enviado_email": 0,
+        "hash_unico": item.get("hash_unico", ""),
+        "fonte_legacy": item.get("fonte", ""),
+    }
+
+
+def to_publication_record(item: Dict) -> Dict:
+    analysis = analyze_text(
+        text=item.get("texto", ""),
+        title=f"{item.get('fonte', '')} - {item.get('processo', '')}",
+        source=item.get("fonte", "oab"),
+    )
+
+    legacy_payload = legacy_payload_from_item(item, analysis)
+    external_id = item.get("hash_unico") or sha_key(
+        item.get("fonte", ""),
+        item.get("processo", ""),
+        item.get("data_publicacao", ""),
+        item.get("texto", "")[:2000],
+    )
+
+    return {
+        "source": item.get("fonte", "OAB"),
+        "external_id": external_id,
+        "process_number": item.get("processo", ""),
+        "title": f"{item.get('fonte', '')} - {item.get('processo', '')}".strip(" -"),
+        "content": item.get("texto", ""),
+        "url": OAB_HISTORICO_URL if "OAB" in item.get("fonte", "") else JUSBRASIL_PROCESSOS_URL,
+        "publication_date": to_iso_br(item.get("data_publicacao", "")),
+        "deadline_date": analysis.get("deadline_date"),
+        "risk_level": analysis.get("risk_level"),
+        "ai_summary": analysis.get("ai_summary"),
+        "ai_action": analysis.get("ai_action"),
+        "ai_tags": analysis.get("ai_tags"),
+        "is_relevant": analysis.get("is_relevant", 1),
+        "alert_sent": 0,
+        "raw_json": json.dumps(
+            {
+                "legacy": legacy_payload,
+                "item_original": item,
+                "analysis": analysis,
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
+def persist_items(items: List[Dict]) -> int:
     inserted = 0
 
     for item in items:
-        if publicacao_existe_por_hash(item["hash_unico"]):
-            continue
-
-        if inserir_publicacao(
-            fonte=item["fonte"],
-            processo=item["processo"],
-            data_publicacao=item["data_publicacao"],
-            texto=item["texto"],
-            relevante=item["relevante"],
-            motivo_filtro=item["motivo_filtro"],
-            hash_unico=item["hash_unico"],
-            parte_autora=item.get("parte_autora", ""),
-            parte_re=item.get("parte_re", ""),
-            tribunal=item.get("tribunal", ""),
-            resumo_ia=item.get("resumo_ia", ""),
-            o_que_fazer=item.get("o_que_fazer", ""),
-            prazo=item.get("prazo", ""),
-            urgencia=item.get("urgencia", ""),
-        ):
+        try:
+            record = to_publication_record(item)
+            upsert_publication(record)
             inserted += 1
+        except Exception as e:
+            log_monitor("monitor_oab", "error", f"Erro ao persistir item {item.get('processo', '')}: {e}")
 
     return inserted
 
 
-def executar_monitor():
-    print("== Iniciando monitor profissional ==")
-    ensure_playwright()
+def run_monitor(days_back: int = 60) -> Dict:
+    init_db()
 
-    all_items = []
+    all_items: List[Dict] = []
+    inserted = 0
 
     try:
-        oab_items = asyncio.run(scrape_oab())
-        print(f"OAB retornou {len(oab_items)} itens.")
+        oab_items = asyncio.run(scrape_oab(days_back=days_back))
+        log_monitor("monitor_oab", "success", f"OAB retornou {len(oab_items)} item(ns).")
         all_items.extend(oab_items)
     except Exception as e:
-        print(f"Erro ao capturar OAB: {e}")
+        log_monitor("monitor_oab", "error", f"Erro ao capturar OAB: {e}")
 
     try:
-        jb_items = asyncio.run(scrape_jusbrasil())
-        print(f"JusBrasil retornou {len(jb_items)} itens.")
-        all_items.extend(jb_items)
+        jb_items = asyncio.run(scrape_jusbrasil(days_back=days_back))
+        if jb_items:
+            log_monitor("monitor_oab", "success", f"JusBrasil retornou {len(jb_items)} item(ns).")
+            all_items.extend(jb_items)
     except Exception as e:
-        print(f"Erro na captura JusBrasil: {e}")
+        log_monitor("monitor_oab", "warning", f"JusBrasil indisponível: {e}")
 
-    inserted = persist_items(all_items)
-    print(f"Novas publicações inseridas: {inserted}")
+    if all_items:
+        inserted = persist_items(all_items)
 
-    process_alerts()
-    print("== Monitor finalizado ==")
+    log_monitor(
+        "monitor_oab",
+        "success",
+        f"Monitor finalizado. Capturados: {len(all_items)} | Persistidos: {inserted}",
+    )
+
+    return {
+        "captured": len(all_items),
+        "persisted": inserted,
+    }
+
+
+def executar_monitor(days_back: int = 60) -> Dict:
+    return run_monitor(days_back=days_back)
 
 
 if __name__ == "__main__":
-    executar_monitor()
+    result = run_monitor(days_back=60)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
