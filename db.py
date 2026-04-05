@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -6,16 +7,14 @@ from typing import Any, Dict, List, Optional
 
 
 def _get_db_path() -> str:
-    """
-    Tenta ler do config.py.
-    Se não existir, usa data/jammal_control.db.
-    """
     try:
         import config  # type: ignore
 
         db_path = getattr(config, "DB_PATH", None)
         if db_path:
-            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
             return db_path
     except Exception:
         pass
@@ -37,6 +36,32 @@ def get_conn():
         conn.commit()
     finally:
         conn.close()
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def _safe_json_load(value: Any) -> Dict[str, Any]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def _iso_to_br(iso_value: Optional[str]) -> str:
+    if not iso_value:
+        return ""
+    try:
+        value = str(iso_value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(value)
+        return dt.strftime("%d/%m/%Y %H:%M:%S")
+    except Exception:
+        return str(iso_value)
 
 
 def init_db() -> None:
@@ -98,10 +123,6 @@ def init_db() -> None:
         )
 
 
-def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
-
-
 def log_monitor(monitor_name: str, status: str, message: str = "") -> None:
     with get_conn() as conn:
         conn.execute(
@@ -114,13 +135,8 @@ def log_monitor(monitor_name: str, status: str, message: str = "") -> None:
 
 
 def upsert_publication(data: Dict[str, Any]) -> int:
-    """
-    Salva ou atualiza uma publicação.
-    Retorna o id do registro.
-    """
-    required_source = data.get("source", "unknown")
+    source = data.get("source", "unknown")
     external_id = data.get("external_id")
-
     created_at = now_iso()
     updated_at = now_iso()
 
@@ -130,10 +146,12 @@ def upsert_publication(data: Dict[str, Any]) -> int:
         if external_id:
             existing = cursor.execute(
                 """
-                SELECT id FROM publications
+                SELECT id
+                FROM publications
                 WHERE source = ? AND external_id = ?
+                LIMIT 1
                 """,
-                (required_source, external_id),
+                (source, external_id),
             ).fetchone()
 
             if existing:
@@ -151,6 +169,7 @@ def upsert_publication(data: Dict[str, Any]) -> int:
                         ai_action = ?,
                         ai_tags = ?,
                         is_relevant = ?,
+                        alert_sent = ?,
                         raw_json = ?,
                         updated_at = ?
                     WHERE id = ?
@@ -167,6 +186,7 @@ def upsert_publication(data: Dict[str, Any]) -> int:
                         data.get("ai_action"),
                         data.get("ai_tags"),
                         int(bool(data.get("is_relevant", 1))),
+                        int(bool(data.get("alert_sent", 0))),
                         data.get("raw_json"),
                         updated_at,
                         existing["id"],
@@ -198,7 +218,7 @@ def upsert_publication(data: Dict[str, Any]) -> int:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                required_source,
+                source,
                 external_id,
                 data.get("process_number"),
                 data.get("title"),
@@ -279,7 +299,8 @@ def mark_drive_file_processed(file_id: str) -> None:
         conn.execute(
             """
             UPDATE drive_files
-            SET processed = 1, updated_at = ?
+            SET processed = 1,
+                updated_at = ?
             WHERE file_id = ?
             """,
             (now_iso(), file_id),
@@ -291,7 +312,8 @@ def mark_alert_sent(publication_id: int) -> None:
         conn.execute(
             """
             UPDATE publications
-            SET alert_sent = 1, updated_at = ?
+            SET alert_sent = 1,
+                updated_at = ?
             WHERE id = ?
             """,
             (now_iso(), publication_id),
@@ -328,6 +350,20 @@ def get_recent_publications(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+def get_publication_by_id(publication_id: int) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM publications
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (publication_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def get_publication_by_external_id(source: str, external_id: str) -> Optional[Dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute(
@@ -357,7 +393,77 @@ def get_unprocessed_drive_files(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
-# aliases de compatibilidade
+def _row_to_legacy_publicacao(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = _safe_json_load(row.get("raw_json"))
+    legacy = _safe_json_load(raw.get("legacy"))
+
+    processo = legacy.get("processo") or row.get("process_number") or ""
+    data_publicacao = legacy.get("data_publicacao") or _iso_to_br(row.get("publication_date"))
+    texto = legacy.get("texto") or row.get("content") or ""
+    relevante = legacy.get("relevante")
+    if relevante is None:
+        relevante = bool(row.get("is_relevant", 0))
+
+    motivo_filtro = legacy.get("motivo_filtro") or row.get("risk_level") or ""
+    parte_autora = legacy.get("parte_autora") or ""
+    parte_re = legacy.get("parte_re") or ""
+    tribunal = legacy.get("tribunal") or ""
+    resumo_ia = legacy.get("resumo_ia") or row.get("ai_summary") or ""
+    o_que_fazer = legacy.get("o_que_fazer") or row.get("ai_action") or ""
+    prazo = legacy.get("prazo") or row.get("deadline_date") or ""
+    urgencia = legacy.get("urgencia") or row.get("risk_level") or ""
+    enviado_email = legacy.get("enviado_email")
+    if enviado_email is None:
+        enviado_email = int(bool(row.get("alert_sent", 0)))
+
+    hash_unico = legacy.get("hash_unico") or row.get("external_id") or ""
+    fonte = legacy.get("fonte_legacy") or row.get("source") or ""
+
+    return {
+        "id": row.get("id"),
+        "fonte": fonte,
+        "processo": processo,
+        "data_publicacao": data_publicacao,
+        "texto": texto,
+        "relevante": bool(relevante),
+        "motivo_filtro": motivo_filtro,
+        "parte_autora": parte_autora,
+        "parte_re": parte_re,
+        "tribunal": tribunal,
+        "resumo_ia": resumo_ia,
+        "o_que_fazer": o_que_fazer,
+        "prazo": prazo,
+        "urgencia": urgencia,
+        "enviado_email": int(bool(enviado_email)),
+        "hash_unico": hash_unico,
+        "source": row.get("source"),
+        "external_id": row.get("external_id"),
+        "url": row.get("url"),
+    }
+
+
+def fetch_publicacoes(limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        rows = get_recent_publications(limit=limit)
+        return [_row_to_legacy_publicacao(row) for row in rows]
+    except Exception:
+        return []
+
+
+def fetch_publicacoes_recentes(limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        return fetch_publicacoes(limit=limit)
+    except Exception:
+        return []
+
+
+def buscar_publicacoes(limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        return fetch_publicacoes(limit=limit)
+    except Exception:
+        return []
+
+
 def initialize_database() -> None:
     init_db()
 
