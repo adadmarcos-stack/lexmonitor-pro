@@ -10,9 +10,22 @@ from config import OAB_LOGIN_URL, OAB_NUMERO, OAB_UF, OAB_CPF, OAB_IDENTIDADE
 OAB_HISTORICO_URL = "https://recortedigital.oabmg.org.br/historico/historicodata.aspx"
 
 
-# ===============================
-# LOGIN ROBUSTO
-# ===============================
+async def get_visible_inputs(page):
+    inputs = page.locator("input")
+    total = await inputs.count()
+    visible = []
+
+    for i in range(total):
+        try:
+            item = inputs.nth(i)
+            if await item.is_visible():
+                visible.append(item)
+        except Exception:
+            continue
+
+    return visible
+
+
 async def fill_oab_login(page):
     print("🔐 Preenchendo login OAB...")
 
@@ -22,32 +35,58 @@ async def fill_oab_login(page):
     cpf = re.sub(r"\D", "", OAB_CPF)
     identidade = re.sub(r"\D", "", OAB_IDENTIDADE)
 
-    inputs = page.locator("input")
-    count = await inputs.count()
+    visible_inputs = await get_visible_inputs(page)
 
-    if count < 3:
-        raise RuntimeError("Campos de login não encontrados.")
+    print(f"Inputs visíveis encontrados: {len(visible_inputs)}")
 
-    await inputs.nth(0).fill(numero)
+    if len(visible_inputs) < 3:
+        raise RuntimeError("Campos visíveis de login não encontrados.")
+
+    await visible_inputs[0].fill(numero)
     await page.wait_for_timeout(500)
 
-    await inputs.nth(1).fill(cpf)
+    try:
+        selects = page.locator("select")
+        if await selects.count():
+            try:
+                await selects.nth(0).select_option(label=OAB_UF)
+            except Exception:
+                await selects.nth(0).select_option(value=OAB_UF)
+    except Exception:
+        pass
+
+    await visible_inputs[1].fill(cpf)
     await page.wait_for_timeout(500)
 
-    await inputs.nth(2).fill(identidade)
+    await visible_inputs[2].fill(identidade)
     await page.wait_for_timeout(500)
 
     try:
         await page.locator("button:has-text('Entrar')").click()
-    except:
-        await page.locator("input[type='submit']").click()
+    except Exception:
+        try:
+            await page.locator("input[type='submit']").click()
+        except Exception:
+            raise RuntimeError("Botão ENTRAR não encontrado.")
 
     print("✅ Login enviado")
 
 
-# ===============================
-# FLUXO PÓS LOGIN (SEU CAMINHO)
-# ===============================
+async def click_if_exists(page, selectors, label, wait_ms=4000):
+    for sel in selectors:
+        try:
+            locator = page.locator(sel)
+            if await locator.count():
+                await locator.first.click()
+                print(f"Clicou em: {label}")
+                await page.wait_for_timeout(wait_ms)
+                return True
+        except Exception:
+            continue
+    print(f"Não encontrou: {label}")
+    return False
+
+
 async def fluxo_pos_login(page):
     print("⏳ Aguardando tela após login...")
     await page.wait_for_timeout(5000)
@@ -56,9 +95,6 @@ async def fluxo_pos_login(page):
     await page.goto(OAB_HISTORICO_URL)
     await page.wait_for_timeout(5000)
 
-    # ===============================
-    # DEFINIR DATAS AUTOMÁTICAS
-    # ===============================
     hoje = datetime.now()
     inicio = hoje - timedelta(days=60)
 
@@ -67,42 +103,44 @@ async def fluxo_pos_login(page):
 
     print(f"Preenchendo datas: {data_inicio} até {data_fim}")
 
-    inputs = page.locator("input")
+    visible_inputs = await get_visible_inputs(page)
 
-    try:
-        await inputs.nth(0).fill(data_inicio)
-        await inputs.nth(1).fill(data_fim)
-    except:
-        print("⚠️ Não conseguiu preencher datas (segue mesmo assim)")
+    if len(visible_inputs) >= 2:
+        try:
+            await visible_inputs[0].fill(data_inicio)
+            await visible_inputs[1].fill(data_fim)
+            print("Datas preenchidas.")
+        except Exception:
+            print("⚠️ Não conseguiu preencher datas.")
+    else:
+        print("⚠️ Campos de data não encontrados.")
 
     await page.wait_for_timeout(1000)
 
-    # ===============================
-    # CLICAR CONSULTAR
-    # ===============================
-    try:
-        await page.locator("button:has-text('Consultar')").click()
-        print("Clicou CONSULTAR")
-    except:
-        print("❌ Botão CONSULTAR não encontrado")
+    await click_if_exists(
+        page,
+        [
+            "button:has-text('Consultar')",
+            "text=Consultar",
+            "input[value='Consultar']",
+            "button[type='submit']",
+        ],
+        "CONSULTAR",
+        wait_ms=5000,
+    )
 
-    await page.wait_for_timeout(4000)
-
-    # ===============================
-    # CLICAR VISUALIZAR TUDO
-    # ===============================
-    try:
-        await page.locator("button:has-text('Visualizar tudo')").click()
-        print("Clicou VISUALIZAR TUDO")
-    except:
-        print("⚠️ Botão VISUALIZAR TUDO não apareceu")
-
-    await page.wait_for_timeout(5000)
+    await click_if_exists(
+        page,
+        [
+            "button:has-text('Visualizar tudo')",
+            "text=Visualizar tudo",
+            "input[value='Visualizar tudo']",
+        ],
+        "VISUALIZAR TUDO",
+        wait_ms=6000,
+    )
 
 
-# ===============================
-# SCRAPER PRINCIPAL
-# ===============================
 async def scrape_oab():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -124,16 +162,13 @@ async def scrape_oab():
         texto = await page.locator("body").inner_text()
 
         print("\n========== RESULTADO ==========\n")
-        print(texto[:2000])  # preview
+        print(texto[:3000])
 
         await browser.close()
 
         return texto
 
 
-# ===============================
-# EXECUÇÃO
-# ===============================
 def executar_monitor():
     try:
         resultado = asyncio.run(scrape_oab())
