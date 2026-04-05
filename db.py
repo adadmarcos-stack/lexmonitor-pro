@@ -7,17 +7,15 @@ from typing import Any, Dict, List, Optional
 
 def _get_db_path() -> str:
     """
-    Tenta usar DB_PATH do config.py.
-    Se não existir, usa data/jammal_control.db
+    Tenta ler do config.py.
+    Se não existir, usa data/jammal_control.db.
     """
     try:
         import config  # type: ignore
 
         db_path = getattr(config, "DB_PATH", None)
         if db_path:
-            db_dir = os.path.dirname(db_path)
-            if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
             return db_path
     except Exception:
         pass
@@ -39,10 +37,6 @@ def get_conn():
         conn.commit()
     finally:
         conn.close()
-
-
-def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
 
 
 def init_db() -> None:
@@ -104,6 +98,10 @@ def init_db() -> None:
         )
 
 
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
 def log_monitor(monitor_name: str, status: str, message: str = "") -> None:
     with get_conn() as conn:
         conn.execute(
@@ -116,8 +114,13 @@ def log_monitor(monitor_name: str, status: str, message: str = "") -> None:
 
 
 def upsert_publication(data: Dict[str, Any]) -> int:
-    source = data.get("source", "unknown")
+    """
+    Salva ou atualiza uma publicação.
+    Retorna o id do registro.
+    """
+    required_source = data.get("source", "unknown")
     external_id = data.get("external_id")
+
     created_at = now_iso()
     updated_at = now_iso()
 
@@ -127,12 +130,10 @@ def upsert_publication(data: Dict[str, Any]) -> int:
         if external_id:
             existing = cursor.execute(
                 """
-                SELECT id
-                FROM publications
+                SELECT id FROM publications
                 WHERE source = ? AND external_id = ?
-                LIMIT 1
                 """,
-                (source, external_id),
+                (required_source, external_id),
             ).fetchone()
 
             if existing:
@@ -197,7 +198,7 @@ def upsert_publication(data: Dict[str, Any]) -> int:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                source,
+                required_source,
                 external_id,
                 data.get("process_number"),
                 data.get("title"),
@@ -278,8 +279,7 @@ def mark_drive_file_processed(file_id: str) -> None:
         conn.execute(
             """
             UPDATE drive_files
-            SET processed = 1,
-                updated_at = ?
+            SET processed = 1, updated_at = ?
             WHERE file_id = ?
             """,
             (now_iso(), file_id),
@@ -291,8 +291,7 @@ def mark_alert_sent(publication_id: int) -> None:
         conn.execute(
             """
             UPDATE publications
-            SET alert_sent = 1,
-                updated_at = ?
+            SET alert_sent = 1, updated_at = ?
             WHERE id = ?
             """,
             (now_iso(), publication_id),
@@ -329,20 +328,6 @@ def get_recent_publications(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
-def get_publication_by_id(publication_id: int) -> Optional[Dict[str, Any]]:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM publications
-            WHERE id = ?
-            LIMIT 1
-            """,
-            (publication_id,),
-        ).fetchone()
-        return dict(row) if row else None
-
-
 def get_publication_by_external_id(source: str, external_id: str) -> Optional[Dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute(
@@ -372,43 +357,10 @@ def get_unprocessed_drive_files(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
-# =========================
-# ALIASES / COMPATIBILIDADE
-# =========================
-
+# aliases de compatibilidade
 def initialize_database() -> None:
     init_db()
 
 
 def init_database() -> None:
     init_db()
-
-
-def fetch_publicacoes(limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Compatibilidade com app.py antigo.
-    """
-    try:
-        return get_recent_publications(limit=limit)
-    except Exception:
-        return []
-
-
-def fetch_publicacoes_recentes(limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Compatibilidade extra.
-    """
-    try:
-        return get_recent_publications(limit=limit)
-    except Exception:
-        return []
-
-
-def buscar_publicacoes(limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Compatibilidade extra.
-    """
-    try:
-        return get_recent_publications(limit=limit)
-    except Exception:
-        return []
