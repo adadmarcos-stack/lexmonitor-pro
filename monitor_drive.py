@@ -13,6 +13,24 @@ from process_ai import analyze_text
 
 
 def _to_publication_record(file_meta: Dict, extracted_text: str, analysis: Dict) -> Dict:
+    legacy_payload = {
+        "processo": analysis.get("process_number", ""),
+        "data_publicacao": file_meta.get("modifiedTime", ""),
+        "texto": extracted_text,
+        "relevante": bool(analysis.get("is_relevant", 1)),
+        "motivo_filtro": analysis.get("risk_level", ""),
+        "parte_autora": "",
+        "parte_re": "",
+        "tribunal": "GOOGLE DRIVE",
+        "resumo_ia": analysis.get("ai_summary", ""),
+        "o_que_fazer": analysis.get("ai_action", ""),
+        "prazo": analysis.get("deadline_date", "") or "",
+        "urgencia": analysis.get("risk_level", "") or "",
+        "enviado_email": 0,
+        "hash_unico": file_meta.get("id"),
+        "fonte_legacy": "Google Drive",
+    }
+
     return {
         "source": "google_drive",
         "external_id": file_meta.get("id"),
@@ -28,7 +46,14 @@ def _to_publication_record(file_meta: Dict, extracted_text: str, analysis: Dict)
         "ai_tags": analysis.get("ai_tags"),
         "is_relevant": analysis.get("is_relevant", 1),
         "alert_sent": 0,
-        "raw_json": json.dumps(file_meta, ensure_ascii=False),
+        "raw_json": json.dumps(
+            {
+                "legacy": legacy_payload,
+                "file_meta": file_meta,
+                "analysis": analysis,
+            },
+            ensure_ascii=False,
+        ),
     }
 
 
