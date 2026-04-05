@@ -7,6 +7,36 @@ app.secret_key = SECRET_KEY
 init_db()
 
 
+# ─── Scheduler automático (roda os monitores a cada 6 horas) ─────────────────
+def _run_monitors_background():
+    try:
+        from monitor_oab import run as run_oab
+        print("[Scheduler] Iniciando monitor OAB...")
+        run_oab()
+        print("[Scheduler] Monitor OAB concluído.")
+    except Exception as e:
+        print(f"[Scheduler] Erro monitor OAB: {e}")
+
+    try:
+        from monitor_drive import run_monitor
+        print("[Scheduler] Iniciando monitor Drive...")
+        run_monitor()
+        print("[Scheduler] Monitor Drive concluído.")
+    except Exception as e:
+        print(f"[Scheduler] Erro monitor Drive: {e}")
+
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(_run_monitors_background, "interval", hours=6, id="monitor_job")
+    scheduler.start()
+    print("[Scheduler] Agendador iniciado — monitores a cada 6 horas.")
+except Exception as _sched_err:
+    print(f"[Scheduler] APScheduler não disponível: {_sched_err}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def filtrar_publicacoes(publicacoes, busca="", somente_relevantes=False, somente_novas=False):
     busca_norm = (busca or "").upper()
     filtradas = []
@@ -103,6 +133,54 @@ def index():
 @app.route("/ping")
 def ping():
     return {"status": "ok"}
+
+
+@app.route("/run-monitors", methods=["POST"])
+def run_monitors_manual():
+    """Rota para disparar os monitores manualmente (requer login)."""
+    if not logged_in():
+        return {"error": "não autorizado"}, 401
+
+    import threading
+    t = threading.Thread(target=_run_monitors_background, daemon=True)
+    t.start()
+    return {"status": "Monitores iniciados em background. Aguarde alguns minutos e recarregue a página."}
+
+
+@app.route("/run-oab", methods=["POST"])
+def run_oab_manual():
+    """Dispara somente o monitor OAB/Recorte Digital (requer login)."""
+    if not logged_in():
+        return {"error": "não autorizado"}, 401
+
+    def _run():
+        try:
+            from monitor_oab import run as run_oab
+            run_oab()
+        except Exception as e:
+            print(f"Erro run_oab manual: {e}")
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "Monitor OAB iniciado. Aguarde e recarregue em alguns minutos."}
+
+
+@app.route("/run-drive", methods=["POST"])
+def run_drive_manual():
+    """Dispara somente o monitor Google Drive (requer login)."""
+    if not logged_in():
+        return {"error": "não autorizado"}, 401
+
+    def _run():
+        try:
+            from monitor_drive import run_monitor
+            run_monitor()
+        except Exception as e:
+            print(f"Erro run_drive manual: {e}")
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "Monitor Drive iniciado. Aguarde e recarregue em alguns minutos."}
 
 
 if __name__ == "__main__":
